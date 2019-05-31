@@ -1,0 +1,375 @@
+/*
+    brunel.sli
+
+    Copyright (C) 2004 The NEST Initiative 
+                
+    This file is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+ 
+    This file is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+ 
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330,
+    Boston, MA  02111-1307, USA.
+*/
+
+/*
+   Brunel Network
+
+   The SLI code in this file creates a sparsely coupled network of
+   excitatory and inhibitory neurons.  Connections within and across
+   both populations are created at random.  Both neuron populations
+   receive Poissonian background input.  The spike output of 500
+   neurons from each population are recorded.  Neurons are modeled
+   as leaky integrate-and-fire neurons with current-injecting synapses
+   (alpha functions).  The model is based on 
+
+      Nicolas Brunel
+      Dynamics of sparsely connected networks of excitatory 
+      and inhibitory spiking neurons
+      Journal of Computational Neuroscience, 2000, vol 8, pp 183-208.
+
+   There are two differences to Brunel's model: we use alpha
+   functions instead of delta for synaptic currents, and our neurons
+   reset to the resting potential (0 mv) instead of to half-way
+   between resting potential and threshold. 
+
+   This example shows how to
+
+      - organize subpopulations in subnets
+      - instrument a network with injection and recording devices
+      - record data to files
+      - define own functions
+      - set parameters in a simple way
+      - communicate with the user in a simple way
+   
+   Abigail Morrison, Marc-Oliver Gewaltig, Hans Ekkehard Plesser
+*/
+
+%%% PARAMETER SECTION %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% define all relevant parameters: changes should be made here
+% all data is place in the userdict dictionary
+
+userdict begin        % open dictionary, all variables stored here
+   
+  /order 2500 def     % scales size of network (total 5*order neurons)
+
+  % case C : slow oscillations 
+  /g      5.0 def    % rel strength, inhibitory synapses
+  /eta    2.0 def    % nu_ext / nu_thresh
+
+  % case D : slow oscillations 
+  %/g      4.5  def    % rel strength, inhibitory synapses
+  %/eta    0.95 def    % nu_ext / nu_thresh
+
+  /simtime 1000.0 def % simulation time [ms] 
+  /dt         0.1 def % simulation step length [ms]   
+
+  /connectseed 12345789 def   % seed for random generator for conns.
+  /kernelseeds [43210987] def % seed(s) for kernel rng(s)
+                              % array with one element per thread 
+
+  /exfilename (spikes_ex.gdf) def  % output file for excit. population  
+  /infilename (spikes_in.gdf) def  % output file for excit. population  
+
+end  % close userdict
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%       NO USER-SERVICABLE PARTS BELOW
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%% FUNCTION SECTION %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Take spike detector, find total number of spikes registered,
+% return average rate per neuron in Hz
+% 
+% spike_det ComputeRate -> rate
+/ComputeRate
+{
+  userdict begin     % ensure we are in userdict  
+    GetStatus        % get entire status dictionary
+    /events get      % extract number of spike recorded
+    Nrec simtime mul % normalization factor
+    cvd div          % convert divisor to double before dividing              
+    1000 mul         % convert from mHz to Hz, leave on stack
+  end
+} bind             % optional, improves performance 
+def
+
+%%% PREPARATION SECTION %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+userdict begin
+
+  /NE 4 order mul cvi def  % number of excitatory neurons
+  /NI 1 order mul cvi def  % number of inhibitory neurons
+  /N  NI NE add def        % total number of neurons
+
+  /epsilon 0.1 def            % connectivity 
+  /CE epsilon NE mul cvi def  % number of excitatory synapses on neuron
+  /CI epsilon NI mul cvi def  % number of inhibitory synapses on neuron
+  /C  CE CI add def           % total number of internal synapses per n.   
+  /Cext CE def                % number of external synapses on neuron  
+
+  /tauMem 20.0 def    % neuron membrane time constant [ms]
+  /tauSyn  0.5 def    % synaptic time constant [ms]
+  /tauRef  2.0 def    % refractory time [ms]
+  /U0      0.0 def    % resting potential [mV]
+  /theta  20.0 def    % threshold 
+
+  % synaptic weights, scaled for our alpha functions, such that
+  % for constant membrane potential, charge J would be deposited
+  /delay   1.5 def         % synaptic delay, all connections [ms]  
+  /J       0.1 def         % synaptic weight [mV]
+  /fudge 0.41363506632638 def   % ensures dV = J at V=0  
+  /JE J tauSyn div fudge mul def
+  /JI g JE mul neg def     % inhibitory  
+  
+  % threshold rate  
+  /nu_thresh theta J CE mul tauMem mul div def
+  /nu_ext eta nu_thresh mul def     % external rate per synapse
+  /p_rate nu_ext Cext mul 1000. mul def % external input rate per neuron  
+                                        % must be given in Hz
+
+  % number of neurons per population to record from
+  /Nrec 500 def
+
+  % number of synapses---just so we know
+  /Nsyn
+    C          % internal synapses
+    1 add      % synapse from PoissonGenerator
+    N mul      
+    Nrec 2 mul % "synapses" to spike detectors
+    add   
+  def
+
+end
+
+%%% CONSTRUCTION SECTION %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+ResetKernel      % clear all existing network elements
+
+modeldict begin  % open model and user dictionaries
+  userdict begin
+
+    % set resolution and limits on delays
+    % limits must be set BEFORE connecting any elements
+    [0]
+    <<
+      /resolution dt
+      /min_delay  dt
+      /max_delay  delay
+    >> SetStatus
+    
+    tic % start timer on construction    
+
+    (Creating excitatory population.) =  % show message
+    /E_net subnet Create def     % create subnet
+    E_net ChangeSubnet           % enter subnet
+    iaf_neuron NE CreateMany     % create neurons in subnet 
+    ;                            % pop port numbers returned by CreateMany
+    [0] ChangeSubnet             % return to full network
+
+    (Creating inhibitory population.) =  % show message
+    /I_net subnet Create def     % create subnet
+    I_net ChangeSubnet           % enter subnet
+    iaf_neuron NI CreateMany     % create neurons in subnet 
+    ;                            % pop port numbers returned by CreateMany
+    [0] ChangeSubnet             % return to full network
+
+    (Creating excitatory Poisson generator.) =
+    /expoisson poisson_generator Create def   
+    expoisson        
+    <<                % set firing rate
+      /rate p_rate
+    >> SetStatus
+
+    (Creating inhibitory Poisson generator.) =
+    /inpoisson poisson_generator Create def
+    inpoisson
+    <<
+      /rate p_rate
+    >> SetStatus
+
+    % one detector would in principle be enough,
+    % but by recording the populations separately,
+    % we save us a lot of sorting work later    
+    (Creating excitatory spike detector.) =
+    /exsd spike_detector Create def
+    exsd
+    << 
+      /withtime true   % record time of spikes
+      /withpath true   % record which neuron spiked
+    >> SetStatus
+
+    (Creating inhibitory spike detector.) =
+    /insd spike_detector Create def
+    insd
+    << 
+      /withtime true 
+      /withpath true 
+    >> SetStatus
+
+    % some connecting functions need lists (arrays) over all
+    % neurons they should work on, so we need to extract these
+    % lists from the subnetworks    
+
+    % obtain array with GIDs of all excitatory neurons    
+    /E_neurons E_net GetNodes def
+
+    % obtain array with GIDs of all inhibitory neurons    
+    /I_neurons I_net GetNodes def
+
+    % all neurons    
+    /allNeurons E_neurons I_neurons join def
+
+    (Configuring neuron parameters.) =
+    allNeurons
+    {
+      dup    % make copy of GID for ReserveConnections call
+      <<
+        /Tau    tauMem
+        /TauSyn tauSyn
+        /TauR   tauRef
+        /U0     U0
+        /Theta  theta
+        /C      1.0     % capacitance is unity in Brunel model      
+      >> SetStatus
+
+      GetAddress  % ReserveConnections need address, not GID
+
+      % reserving space for all connections originating from
+      % a neuron before connecting saves a lot of time      
+      % C is the expected number of outgoing connections from
+      % each neuron      
+      C ReserveConnections 
+    } forall
+
+        
+    % Create random generator to use in randomized connection
+    % functions    
+    /rng    
+      rngdict /knuthlfg get   % extract generator type from rngdict
+      connectseed    
+      CreateRNG
+    def
+
+    (Connecting excitatory population.) =  
+
+    % space for neuron to neuron connections was reserved above    
+    % reserve space for connections from Poisson generator to neurons    
+    expoisson NE ReserveConnections
+
+    E_neurons
+    {
+      /target Set
+
+      % E -> E connections      
+      % the following is a single call to RandomConvergentConnect      
+      rng         % random number generator
+      E_neurons   % source population [we pick from this]
+      target      % target neuron
+      CE          % number of source neurons to pick
+      SpikeEvent  % event==connection type: send spikes!
+      JE          % connection weight
+      delay       % connection delay
+      RandomConvergentConnect
+
+      % I -> E connections 
+      % as above, but on a single line       
+      rng I_neurons target CI SpikeEvent JI delay RandomConvergentConnect
+
+      % Connect Poisson generator to neuron      
+      expoisson         % source: is in address form 
+      target GetAddress % is GID, conversion necessary
+      Connect           % defaults: SpikeEvent, weight 1, delay 1 step
+                        % returns port number      
+      expoisson exch    % stack: expoisson portnumber
+      JE SetWeight      % set weight for port from Poisson gen to node
+    } bind % bind improves efficiency
+    forall
+
+    (Connecting inhibitory population.) =
+
+    % ... as above, just written more compact    
+
+    inpoisson NI ReserveConnections
+
+    I_neurons
+    {
+      /target Set
+      rng E_neurons target CE SpikeEvent JE delay RandomConvergentConnect
+      rng I_neurons target CI SpikeEvent JI delay RandomConvergentConnect
+      inpoisson target GetAddress Connect
+      inpoisson exch JE SetWeight
+    } bind forall
+
+
+    % Spike detectors are connected to the first Nrec neurons in each
+    % population.  Since neurons are equal and connectivity is homogeneously
+    % randomized, this is equivalent to picking Nrec neurons at random
+    % from each population    
+    (Connecting spike detectors.) =    
+
+    exsd Nrec ReserveConnections
+    insd Nrec ReserveConnections
+
+    E_neurons Nrec Take     % pick the first 500 neurons
+    {
+      exsd exch  % stack: SDaddress neuronGID
+      GetAddress % stack: SDaddress neuronaddress
+      Connect    % defaults: SpikeEvent, weight 1, delay 1 step
+      ;          % pop port number
+    } bind forall
+
+    % same for inhibitory population    
+    I_neurons Nrec Take
+    {
+      insd exch GetAddress Connect ;
+    } bind forall
+
+    % read out time used for building    
+    toc /BuildCPUTime Set
+
+  end  % userdict
+end    % modeldict
+
+%%% SIMULATION SECTION %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+userdict begin
+
+  % open output files & register files with detectors
+  /exspikefile exfilename (w) file def
+  exsd << /output_stream exspikefile >> SetStatus
+  
+  /inspikefile infilename (w) file def
+  insd << /output_stream inspikefile >> SetStatus
+
+  % seed kernel RNG(s)
+  [0] << /rng_seeds kernelseeds >> SetStatus
+
+  % run, measure computer time with tic-toc
+  tic
+  simtime Simulate
+  toc /SimCPUTime Set
+
+  % close output files
+  inspikefile close
+  exspikefile close
+
+  % write a little report
+  (\nBrunel Network Simulation) =
+  (Number of Neurons : ) =only N =
+  (Number of Synapses: ) =only Nsyn =
+  (Excitatory rate   : ) =only exsd ComputeRate =only ( Hz) =
+  (Inhibitory rate   : ) =only insd ComputeRate =only ( Hz) =
+  (Building time     : ) =only BuildCPUTime =only ( s) =    
+  (Simulation time   : ) =only SimCPUTime   =only ( s\n) =    
+
+end  % userdict
