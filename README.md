@@ -1,4 +1,4 @@
-# Readme.txt for an implementation of the model associated with the paper:
+# Readme for an implementation of the model associated with the paper:
 
 Brunel N (2000) Dynamics of sparsely connected networks of excitatory and inhibitory spiking neurons. *J Comput Neurosci* 8:183-208
 
